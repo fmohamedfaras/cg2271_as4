@@ -52,9 +52,15 @@
 #define ECHO_PIN        4U
 
 #define SERVO_TPM       TPM0
-#define SERVO_CHANNEL   1U
 #define SERVO_PORT      PORTC
-#define SERVO_PIN       2U
+
+/* Food dispenser servo on PTC1 -> TPM0_CH0 */
+#define FOOD_SERVO_PIN      1U
+#define FOOD_SERVO_CHANNEL  0U
+
+/* Laser sweep servo on PTC2 -> TPM0_CH1 */
+#define LASER_SERVO_PIN     2U
+#define LASER_SERVO_CHANNEL 1U
 
 #define LED_PORT        PORTD
 #define LED_GPIO        GPIOD
@@ -280,13 +286,19 @@ static void parse_rx(void)
 
 /* ========================= SERVO ========================================= */
 
-static void servo_set(uint16_t pulse_us)
+static void food_servo_set(uint16_t pulse_us)
 {
     if (pulse_us < 500)  pulse_us = 500;
     if (pulse_us > 2500) pulse_us = 2500;
-    SERVO_TPM->CONTROLS[SERVO_CHANNEL].CnV = pulse_us / 16;
+    SERVO_TPM->CONTROLS[FOOD_SERVO_CHANNEL].CnV = pulse_us / 16;
 }
 
+static void laser_servo_set(uint16_t pulse_us)
+{
+    if (pulse_us < 500)  pulse_us = 500;
+    if (pulse_us > 2500) pulse_us = 2500;
+    SERVO_TPM->CONTROLS[LASER_SERVO_CHANNEL].CnV = pulse_us / 16;
+}
 /* ========================= MAIN ========================================== */
 
 int main(void)
@@ -335,16 +347,29 @@ int main(void)
     PRINTF("[INIT] LED: PTD%d (ON)\r\n", LED_PIN);
 
     /* Servo */
+    /* --- Servo PWM (Port C) --- */
     CLOCK_SetTpmClock(1U);
-    PORT_SetPinMux(SERVO_PORT, SERVO_PIN, kPORT_MuxAlt4);
-    TPM_GetDefaultConfig(&tpmCfg);
-    tpmCfg.prescale = kTPM_Prescale_Divide_128;
-    TPM_Init(SERVO_TPM, &tpmCfg);
-    SERVO_TPM->CONTROLS[SERVO_CHANNEL].CnSC = TPM_CnSC_MSB_MASK | TPM_CnSC_ELSB_MASK;
-    SERVO_TPM->CONTROLS[SERVO_CHANNEL].CnV = SERVO_CENTER / 16;
-    SERVO_TPM->MOD = SERVO_MOD;
-    TPM_StartTimer(SERVO_TPM, kTPM_SystemClock);
-    PRINTF("[INIT] Servo: PTC%d (50Hz PWM)\r\n", SERVO_PIN);
+
+        /* MUST set pin mux AFTER BOARD_InitBootPins to override any conflicts */
+	PORT_SetPinMux(SERVO_PORT, FOOD_SERVO_PIN,  kPORT_MuxAlt4);  /* PTC1 -> TPM0_CH0 */
+	PORT_SetPinMux(SERVO_PORT, LASER_SERVO_PIN, kPORT_MuxAlt4);  /* PTC2 -> TPM0_CH1 */
+
+	TPM_GetDefaultConfig(&tpmCfg);
+	tpmCfg.prescale = kTPM_Prescale_Divide_128;
+	TPM_Init(SERVO_TPM, &tpmCfg);
+
+	/* Food servo channel */
+	SERVO_TPM->CONTROLS[FOOD_SERVO_CHANNEL].CnSC = TPM_CnSC_MSB_MASK | TPM_CnSC_ELSB_MASK;
+	SERVO_TPM->CONTROLS[FOOD_SERVO_CHANNEL].CnV = SERVO_CENTER / 16;
+
+	/* Laser servo channel */
+	SERVO_TPM->CONTROLS[LASER_SERVO_CHANNEL].CnSC = TPM_CnSC_MSB_MASK | TPM_CnSC_ELSB_MASK;
+	SERVO_TPM->CONTROLS[LASER_SERVO_CHANNEL].CnV = SERVO_CENTER / 16;
+
+	SERVO_TPM->MOD = SERVO_MOD;
+	TPM_StartTimer(SERVO_TPM, kTPM_SystemClock);
+	PRINTF("[INIT] Food servo: PTC%d (CH%d)\r\n", FOOD_SERVO_PIN, FOOD_SERVO_CHANNEL);
+	PRINTF("[INIT] Laser servo: PTC%d (CH%d)\r\n", LASER_SERVO_PIN, LASER_SERVO_CHANNEL);
 
     /* UART2 */
     PORT_SetPinMux(ESP_TX_PORT, ESP_TX_PIN, kPORT_MuxAlt4);
@@ -400,34 +425,31 @@ int main(void)
 
         /* === MODE-based servo control === */
         switch (currentMode) {
-
         case MODE_FEEDING:
-            /* Open food gate for FEED_DURATION_MS then return to idle */
-            servo_set(SERVO_FEED_OPEN);
+            food_servo_set(SERVO_FEED_OPEN);
             if ((sysMs - feedStartMs) >= FEED_DURATION_MS) {
-                servo_set(SERVO_FEED_CLOSED);
+                food_servo_set(SERVO_FEED_CLOSED);
                 delay_ms(500);
-                servo_set(SERVO_CENTER);
+                food_servo_set(SERVO_CENTER);
                 currentMode = MODE_IDLE;
                 PRINTF("[FEED] Done, gate closed\r\n");
             }
             break;
 
         case MODE_PLAYING:
-            /* Sweep servo for laser play */
             sweepPos += sweepDir;
             if (sweepPos >= SERVO_RIGHT) { sweepPos = SERVO_RIGHT; sweepDir = -sweepDir; }
             if (sweepPos <= SERVO_LEFT)  { sweepPos = SERVO_LEFT;  sweepDir = -sweepDir; }
-            servo_set(sweepPos);
+            laser_servo_set(sweepPos);
             break;
 
         case MODE_IDLE:
         default:
-            servo_set(SERVO_CENTER);
+            food_servo_set(SERVO_CENTER);
+            laser_servo_set(SERVO_CENTER);
             sweepPos = SERVO_CENTER;
             break;
         }
-
         delay_ms(140);
     }
 
