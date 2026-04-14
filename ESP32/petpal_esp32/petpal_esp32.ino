@@ -1,6 +1,6 @@
 /*
  * =============================================================================
- * PetPal v2 - ESP32-S2 Unified (Final Integration)
+ * PetPal v3 - ESP32-S2 Unified (MPU6050 Integration)
  * =============================================================================
  * Sensors + Firebase Realtime Database + UART bridge to MCXC444
  *
@@ -12,16 +12,20 @@
  *   ESP -> MCX:  [0xBB][0x12]                        (stop command)
  *
  * Pins:
- *   GPIO 3  - Water level AO (ADC)
- *   GPIO 5  - Shock sensor DO (interrupt)
+ *   GPIO 1  - Water level AO (ADC)
+ *   GPIO 3  - MPU6050 INT (shock interrupt)
  *   GPIO 7  - Passive buzzer (LEDC PWM)
+ *   GPIO 8  - I2C SDA (MPU6050)
  *   GPIO 9  - Laser emitter (digital out)
+ *   GPIO 10 - I2C SCL (MPU6050)
  *   GPIO 11 - DHT11 data
  *   GPIO 17 - UART TX -> MCXC444 PTE23 (RX)
  *   GPIO 18 - UART RX <- MCXC444 PTE22 (TX)
  *
  * Board: ESP32S2 Dev Module, USB CDC On Boot: Enabled
- * Library: DHT sensor library (Adafruit)
+ * Libraries:
+ *   - DHT sensor library (Adafruit)
+ *   - MPU6050 by Electronic Cats
  * =============================================================================
  */
 
@@ -29,10 +33,12 @@
 #include <WiFiClientSecure.h>
 #include <HTTPClient.h>
 #include <DHT.h>
+#include <Wire.h>
+#include <MPU6050.h>
 
 /* ========================= CHANGE THESE ================================== */
-#define WIFI_SSID "shiras 24 ultra"
-#define WIFI_PASSWORD "test1234"
+#define WIFI_SSID "AndroidAP"
+#define WIFI_PASSWORD "yecg5819"
 #define DEVICE_ID "esp32s2-petpal"
 
 /*
@@ -48,13 +54,15 @@
 #define FIREBASE_DEVICE_PATH "/petpal/devices/" DEVICE_ID
 
 /* ========================= PINS ========================================== */
-#define SHOCK_PIN 5
-#define WATER_PIN 3
-#define DHT_PIN 11
-#define BUZZER_PIN 7
-#define LASER_PIN 9
-#define UART_RX_PIN 18
-#define UART_TX_PIN 17
+#define WATER_PIN 1    /* ADC - AO from water sensor              */
+#define MPU_INT_PIN 3  /* MPU6050 INT output                      */
+#define BUZZER_PIN 7   /* Passive buzzer - LEDC PWM               */
+#define SDA_PIN 8      /* I2C SDA for MPU6050                     */
+#define LASER_PIN 9    /* Laser emitter - digital out             */
+#define SCL_PIN 10     /* I2C SCL for MPU6050                     */
+#define DHT_PIN 11     /* DHT11 data                              */
+#define UART_TX_PIN 17 /* UART TX -> MCXC444                      */
+#define UART_RX_PIN 18 /* UART RX <- MCXC444                      */
 
 /* ========================= TIMING ======================================== */
 #define UART_BAUD 115200
@@ -65,9 +73,17 @@
 #define WATER_READ_MS 500
 #define DHT_READ_MS 2000
 #define STATUS_PRINT_MS 2000
-#define SHOCK_DEBOUNCE_MS 200
+#define SHOCK_DEBOUNCE_MS 500
+
+/* ========================= PET DETECTION ================================= */
 #define PET_NEAR_CM 30
 #define PET_FAR_CM 60
+
+/* ========================= WATER LEVELS ================================== */
+#define WATER_EMPTY 50 /* 0   - 50   = empty  */
+#define WATER_LOW 500  /* 50  - 500  = low    */
+#define WATER_OK 2500  /* 500 - 2500 = ok     */
+                       /* 2500+      = full   */
 
 /* ========================= COMMANDS TO MCXC444 =========================== */
 #define CMD_PET_STATUS 0x01
@@ -78,6 +94,9 @@
 /* ========================= DHT =========================================== */
 DHT dht(DHT_PIN, DHT11);
 
+/* ========================= MPU6050 ======================================= */
+MPU6050 mpu;
+
 /* ========================= STATE ========================================= */
 
 /* Sensors */
@@ -86,7 +105,7 @@ float lastHumidity = 0;
 uint16_t lastWater = 0;
 uint16_t lastDistanceCm = 999;
 
-/* Shock */
+/* Shock (MPU6050 motion interrupt) */
 volatile bool shockFlag = false;
 volatile uint32_t shockCount = 0;
 volatile unsigned long lastShockMs = 0;
@@ -121,7 +140,8 @@ unsigned long lastWifiAttempt = 0;
 unsigned long bootTime = 0;
 
 /* UART parser state */
-uint8_t parseState = 0;
+bool inBinaryPacket = false;
+uint8_t binStep = 0;
 uint8_t parseType = 0;
 uint8_t parseHi = 0;
 
@@ -131,7 +151,20 @@ int textIdx = 0;
 
 WiFiClientSecure firebaseClient;
 
-/* ========================= SHOCK ISR ===================================== */
+/* ========================= WATER LEVEL =================================== */
+
+String getWaterLevel(uint16_t raw)
+{
+    if (raw < WATER_EMPTY)
+        return "empty";
+    if (raw < WATER_LOW)
+        return "low";
+    if (raw < WATER_OK)
+        return "ok";
+    return "full";
+}
+
+/* ========================= SHOCK ISR (MPU6050 INT) ======================= */
 
 void IRAM_ATTR shockISR()
 {
@@ -176,14 +209,12 @@ void setLaser(bool on)
 
 void sendToMCX(uint8_t type)
 {
-    /* Send [0xBB][type] — no data byte */
     Serial1.write(0xBB);
     Serial1.write(type);
 }
 
 void sendToMCX(uint8_t type, uint8_t data)
 {
-    /* Send [0xBB][type][data] */
     Serial1.write(0xBB);
     Serial1.write(type);
     Serial1.write(data);
@@ -195,14 +226,6 @@ void sendPetStatus(bool near)
 }
 
 /* ========================= UART FROM MCXC444 ============================= */
-/*
- * Handles two types of incoming data:
- *   1. Binary: [0xAA][0x01][dist_hi][dist_lo]
- *   2. Text: debug lines from MCXC444 PRINTF ([DBG], [MCX], etc.)
- */
-
-bool inBinaryPacket = false;
-uint8_t binStep = 0;
 
 void processSerial1()
 {
@@ -240,7 +263,7 @@ void processSerial1()
             case 2:
                 if (parseType == 0x01)
                 {
-                    lastDistanceCm = (parseHi << 8) | b;
+                    lastDistanceCm = ((uint16_t)parseHi << 8) | b;
 
                     /* Pet detection with hysteresis */
                     if (lastDistanceCm < PET_NEAR_CM)
@@ -252,7 +275,6 @@ void processSerial1()
                         petNear = false;
                     }
 
-                    /* Send pet status back to MCXC444 */
                     sendPetStatus(petNear);
                 }
                 inBinaryPacket = false;
@@ -261,7 +283,7 @@ void processSerial1()
             continue;
         }
 
-        /* Text from MCXC444 PRINTF */
+        /* Text lines from MCXC444 PRINTF */
         if (b == '\n')
         {
             textBuf[textIdx] = '\0';
@@ -299,7 +321,8 @@ void setupWiFi()
 
     if (WiFi.status() == WL_CONNECTED)
     {
-        Serial0.printf("[WIFI] Connected! IP: %s\n", WiFi.localIP().toString().c_str());
+        Serial0.printf("[WIFI] Connected! IP: %s\n",
+                       WiFi.localIP().toString().c_str());
     }
     else
     {
@@ -390,6 +413,7 @@ void postTelemetry()
     json += "\"distanceCm\":" + String(lastDistanceCm) + ",";
     json += "\"shockDetected\":" + String(shockLatched ? "true" : "false") + ",";
     json += "\"waterLevelRaw\":" + String(lastWater) + ",";
+    json += "\"waterLevel\":\"" + getWaterLevel(lastWater) + "\",";
     json += "\"laserOn\":" + String(laserOn ? "true" : "false") + ",";
     json += "\"playServoMoving\":" + String(playServoMoving ? "true" : "false") + ",";
     json += "\"feederTriggered\":" + String(feederTriggered ? "true" : "false") + ",";
@@ -408,11 +432,13 @@ void postTelemetry()
     }
     else if (code > 0)
     {
-        Serial0.printf("[FIREBASE] Telemetry HTTP %d: %s\n", code, http.getString().c_str());
+        Serial0.printf("[FIREBASE] Telemetry HTTP %d: %s\n",
+                       code, http.getString().c_str());
     }
     else
     {
-        Serial0.printf("[FIREBASE] Telemetry fail: %s\n", http.errorToString(code).c_str());
+        Serial0.printf("[FIREBASE] Telemetry fail: %s\n",
+                       http.errorToString(code).c_str());
     }
     http.end();
 }
@@ -477,7 +503,8 @@ void pollCommands()
         if (code > 0)
             Serial0.printf("[FIREBASE] Cmd poll HTTP %d\n", code);
         else
-            Serial0.printf("[FIREBASE] Cmd poll fail: %s\n", http.errorToString(code).c_str());
+            Serial0.printf("[FIREBASE] Cmd poll fail: %s\n",
+                           http.errorToString(code).c_str());
         http.end();
         return;
     }
@@ -523,7 +550,6 @@ void pollCommands()
 
     if (cmdType == "feed_now")
     {
-        /* Send feed command to MCXC444 */
         sendToMCX(CMD_FEED);
         buzzerTone(1000, 500);
         feederTriggered = true;
@@ -536,7 +562,6 @@ void pollCommands()
     {
         if (!playServoMoving)
         {
-            /* Start play */
             setLaser(true);
             sendToMCX(CMD_PLAY);
             playServoMoving = true;
@@ -546,7 +571,6 @@ void pollCommands()
         }
         else
         {
-            /* Stop play */
             setLaser(false);
             sendToMCX(CMD_STOP);
             playServoMoving = false;
@@ -565,7 +589,7 @@ void readSensors()
 {
     unsigned long now = millis();
 
-    /* Shock */
+    /* Shock (MPU6050 motion interrupt) */
     if (shockFlag)
     {
         noInterrupts();
@@ -611,7 +635,8 @@ void readSensors()
         {
             lastEvent = "pet_arrived";
             buzzerTone(1500, 300);
-            Serial0.printf("[PET] *** DETECTED *** dist: %d cm\n", lastDistanceCm);
+            Serial0.printf("[PET] *** DETECTED *** dist: %d cm\n",
+                           lastDistanceCm);
         }
         else
         {
@@ -630,32 +655,60 @@ void setup()
     bootTime = millis();
 
     Serial0.println("\n========================================");
-    Serial0.println("  PetPal ESP32-S2 Unified");
+    Serial0.println("  PetPal ESP32-S2 v3");
     Serial0.println("  Sensors + Firebase + UART Bridge");
     Serial0.println("========================================\n");
 
+    /* UART to MCXC444 */
     Serial1.begin(UART_BAUD, SERIAL_8N1, UART_RX_PIN, UART_TX_PIN);
     Serial0.printf("[INIT] UART: TX=%d RX=%d\n", UART_TX_PIN, UART_RX_PIN);
 
-    pinMode(SHOCK_PIN, INPUT_PULLUP);
-    attachInterrupt(digitalPinToInterrupt(SHOCK_PIN), shockISR, FALLING);
+    /* Water sensor */
     pinMode(WATER_PIN, INPUT);
     analogReadResolution(12);
+
+    /* DHT11 */
     dht.begin();
 
+    /* Buzzer */
     ledcAttach(BUZZER_PIN, 1000, 8);
     ledcWriteTone(BUZZER_PIN, 0);
+
+    /* Laser */
     pinMode(LASER_PIN, OUTPUT);
     digitalWrite(LASER_PIN, LOW);
 
-    Serial0.printf("[INIT] Shock=%d Water=%d DHT=%d Buzzer=%d Laser=%d\n",
-                   SHOCK_PIN, WATER_PIN, DHT_PIN, BUZZER_PIN, LASER_PIN);
+    /* MPU6050 */
+    Wire.begin(SDA_PIN, SCL_PIN);
+    mpu.initialize();
+
+    if (mpu.testConnection())
+    {
+        Serial0.println("[MPU] Connected OK");
+    }
+    else
+    {
+        Serial0.println("[MPU] ERROR - check SDA/SCL wiring");
+    }
+
+    mpu.setMotionDetectionThreshold(10); /* Raise if too sensitive */
+    mpu.setMotionDetectionDuration(1);
+    mpu.setIntMotionEnabled(true);
+
+    pinMode(MPU_INT_PIN, INPUT);
+    attachInterrupt(digitalPinToInterrupt(MPU_INT_PIN), shockISR, RISING);
+
+    Serial0.printf("[INIT] Water=%d DHT=%d Buzzer=%d Laser=%d\n",
+                   WATER_PIN, DHT_PIN, BUZZER_PIN, LASER_PIN);
+    Serial0.printf("[INIT] MPU6050 SDA=%d SCL=%d INT=%d\n",
+                   SDA_PIN, SCL_PIN, MPU_INT_PIN);
 
     /* Self-test */
     Serial0.println("[TEST] Buzzer...");
     buzzerTone(1000, 200);
     delay(300);
     buzzerOff();
+
     Serial0.println("[TEST] Laser...");
     setLaser(true);
     delay(500);
@@ -674,15 +727,16 @@ void loop()
     unsigned long now = millis();
 
     /* WiFi reconnect */
-    if (WiFi.status() != WL_CONNECTED && (now - lastWifiAttempt) >= WIFI_RETRY_MS)
+    if (WiFi.status() != WL_CONNECTED &&
+        (now - lastWifiAttempt) >= WIFI_RETRY_MS)
     {
         setupWiFi();
     }
 
-    /* UART from MCXC444 (distance + debug text) */
+    /* UART from MCXC444 */
     processSerial1();
 
-    /* Read local sensors + check pet status changes */
+    /* Read local sensors */
     readSensors();
 
     /* PUT telemetry to Firebase */
@@ -708,11 +762,14 @@ void loop()
         Serial0.printf("  Pet:    %s\n", petNear ? "YES" : "no");
         Serial0.printf("  Temp:   %.1fC\n", lastTemp);
         Serial0.printf("  Humid:  %.1f%%\n", lastHumidity);
-        Serial0.printf("  Water:  %d\n", lastWater);
+        Serial0.printf("  Water:  %d (%s)\n", lastWater,
+                       getWaterLevel(lastWater).c_str());
         Serial0.printf("  Shock:  %lu\n", shockCount);
         Serial0.printf("  Laser:  %s\n", laserOn ? "ON" : "OFF");
         Serial0.printf("  Play:   %s\n", playServoMoving ? "YES" : "no");
-        Serial0.printf("  WiFi:   %s\n", WiFi.status() == WL_CONNECTED ? "OK" : "DOWN");
+        Serial0.printf("  WiFi:   %s\n", WiFi.status() == WL_CONNECTED
+                                             ? "OK"
+                                             : "DOWN");
         Serial0.printf("  Event:  %s\n", lastEvent.c_str());
         Serial0.println("--------------\n");
     }
