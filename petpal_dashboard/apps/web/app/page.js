@@ -28,6 +28,19 @@ function numberOrDash(value, digits = 0) {
   return Number(value).toFixed(digits);
 }
 
+function waterLevelLabel(telemetry) {
+  const normalized = String(telemetry?.waterLevel || "").toUpperCase();
+  if (normalized === "EMPTY") return "EMPTY";
+  if (normalized === "LOW") return "LOW";
+  if (normalized === "OK" || normalized === "FULL") return "OK";
+
+  const raw = Number(telemetry?.waterLevelRaw);
+  if (!Number.isFinite(raw)) return "-";
+  if (raw <= 50) return "EMPTY";
+  if (raw <= 500) return "LOW";
+  return "OK";
+}
+
 export default function HomePage() {
   const [state, setState] = useState(null);
   const [busy, setBusy] = useState(false);
@@ -174,7 +187,7 @@ export default function HomePage() {
 
         <section className="card">
           <h3>Water Level</h3>
-          <p className="metric-big">{telemetry?.waterLevelRaw ?? "-"}</p>
+          <p className="metric-big">{waterLevelLabel(telemetry)}</p>
           <p>Device Status: {statusPill}</p>
           <p>Uptime: {telemetry?.uptimeSec ?? "-"} sec</p>
         </section>

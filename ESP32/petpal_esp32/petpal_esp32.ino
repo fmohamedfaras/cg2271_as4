@@ -74,7 +74,7 @@
 #define WATER_READ_MS 500
 #define DHT_READ_MS 2000
 #define STATUS_PRINT_MS 2000
-#define SHOCK_DEBOUNCE_MS 500
+#define GY_DEBOUNCE_MS 500
 #define NTP_TIMEOUT_MS 2000
 
 /* ========================= PET DETECTION ================================= */
@@ -82,8 +82,8 @@
 #define PET_FAR_CM 60
 
 /* ========================= WATER LEVELS ================================== */
-#define WATER_EMPTY 50 /* 0   - 50   = empty  */
-#define WATER_LOW 500  /* 50  - 500  = low    */
+#define WATER_EMPTY 300 /* 0   - 50   = empty  */
+#define WATER_LOW 2000  /* 50  - 500  = low    */
 #define WATER_OK 2500  /* 500 - 2500 = ok     */
                        /* 2500+      = full   */
 
@@ -171,7 +171,7 @@ String getWaterLevel(uint16_t raw)
 void IRAM_ATTR shockISR()
 {
     unsigned long now = millis();
-    if ((now - lastShockMs) >= SHOCK_DEBOUNCE_MS)
+    if ((now - lastShockMs) >= GY_DEBOUNCE_MS)
     {
         lastShockMs = now;
         shockCount++;
